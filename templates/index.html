@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Corretor de Apuração</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <p>Processando... Por favor, aguarde.</p>
+    </div>
+
+    <div class="container">
+        <h1>Corretor de Apuração - Ábaco Moderno</h1>
+        <p>Faça o upload da apuração e dos extratos para iniciar a marcação automática.</p>
+
+        <div id="message-area"></div>
+
+        <form id="upload-form" action="/process" method="post" enctype="multipart/form-data">
+            <div class="upload-section">
+                <div class="upload-column">
+                    <h2>1. Arquivo de Apuração</h2>
+                    <label for="apuracao_pdf" class="file-label">
+                        <span>Clique para selecionar o PDF</span>
+                    </label>
+                    <input type="file" id="apuracao_pdf" name="apuracao_pdf" accept=".pdf" required>
+                    <span id="apuracao-filename" class="filename-display"></span>
+                </div>
+
+                <div class="upload-column">
+                    <h2>2. Extratos Bancários</h2>
+                    <label for="extratos_pdfs" class="file-label">
+                        <span>Clique para selecionar os PDFs</span>
+                    </label>
+                    <input type="file" id="extratos_pdfs" name="extratos_pdfs" accept=".pdf" multiple required>
+                     <span id="extratos-filenames" class="filename-display"></span>
+                </div>
+            </div>
+
+            <button type="submit" class="process-button">Corrigir Apuração</button>
+        </form>
+    </div>
+
+    <script>
+        // Mostra o nome dos arquivos selecionados
+        document.getElementById('apuracao_pdf').addEventListener('change', function() {
+            document.getElementById('apuracao-filename').textContent = this.files.length > 0 ? this.files[0].name : '';
+        });
+        document.getElementById('extratos_pdfs').addEventListener('change', function() {
+            let fileNames = Array.from(this.files).map(f => f.name).join(', ');
+            document.getElementById('extratos-filenames').textContent = fileNames;
+        });
+
+        // Lógica para enviar formulário, mostrar carregamento e abrir nova guia
+        const form = document.getElementById('upload-form');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const messageArea = document.getElementById('message-area');
+
+        form.addEventListener('submit', async function(event) {
+            event.preventDefault(); // Impede o envio padrão do formulário
+
+            // Limpa mensagens antigas e mostra o carregamento
+            messageArea.innerHTML = '';
+            loadingOverlay.classList.add('visible');
+
+            const formData = new FormData(form);
+
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    // Sucesso: abre a URL do arquivo em uma nova guia
+                    window.open(result.file_url, '_blank');
+                    messageArea.innerHTML = `<p class="message success">${result.message}</p>`;
+                } else {
+                    // Erro: mostra a mensagem de erro do servidor
+                    messageArea.innerHTML = `<p class="message error">${result.error}</p>`;
+                }
+
+            } catch (error) {
+                // Erro de rede ou outro problema
+                messageArea.innerHTML = `<p class="message error">Ocorreu um erro de comunicação. Tente novamente.</p>`;
+                console.error('Error:', error);
+            } finally {
+                // Esconde o carregamento, independentemente do resultado
+                loadingOverlay.classList.remove('visible');
+            }
+        });
+    </script>
+</body>
+</html>
