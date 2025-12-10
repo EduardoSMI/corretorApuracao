@@ -2,8 +2,11 @@ from flask import Flask, render_template, request, send_from_directory, jsonify,
 from werkzeug.utils import secure_filename
 import os
 import re
-import pymupdf
+import io
+import pymupdf  # PyMuPDF
 import mysql.connector
+import pytesseract
+from PIL import Image, ImageEnhance
 
 app = Flask(__name__)
 app.secret_key = 'sua_chave_secreta'
@@ -17,190 +20,258 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
 
+# --- DB CONNECTION ---
 def get_db_connection():
     return mysql.connector.connect(
-        user='augusto', password='somma13', host='smiconsult.com.br', database='smiconsult'
+        user='augusto',
+        password='somma13',
+        host='smiconsult.com.br',
+        database='smiconsult'
     )
 
 
-# --- LIMPEZA DE VALORES ---
-def normalize_value(value_str):
-    if not value_str: return None
-    # Remove tudo que não é dígito, vírgula ou ponto
-    clean = re.sub(r'[^\d.,]', '', value_str)
-
-    # Se sobrou vazio
-    if not clean: return None
-
-    # Padrão brasileiro: 1.000,00
-    if ',' in clean and '.' in clean:
-        return clean
-
-    # Corrige 1.234.56 -> 1.234,56 (Erro comum de OCR)
-    if clean.count('.') > 1:
-        parts = clean.rsplit('.', 1)
-        return parts[0].replace('.', '') + ',' + parts[1]
-
-    return clean
-
-
-# --- CONSULTA INTELIGENTE (A MUDANÇA CHAVE) ---
-def get_target_name_from_db(identifier, tipo_identificador='CNPJ'):
-    """
-    Retorna o alvo da busca.
-    Se for conta, retorna o PRÓPRIO NÚMERO DA CONTA para buscar a linha exata na apuração.
-    Se for CNPJ, busca o nome do fundo.
-    """
-    print(f"   [DB] Consultando: {identifier} ({tipo_identificador})...")
-
-    # Se for CONTA, a prioridade é achar essa conta impressa na apuração
-    if tipo_identificador == 'CONTA':
-        # Retorna o próprio número da conta para buscar na apuração (ex: 25165-8)
-        # Isso resolve o problema de fundos com múltiplas contas
-        return identifier
-
-        # Se for CNPJ, buscamos o nome do fundo
+def get_fund_name_from_db(cnpj_raw):
+    if not cnpj_raw: return None
+    clean_cnpj = re.sub(r'[^\d]', '', cnpj_raw)
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        nome_fundo = None
-
-        if tipo_identificador == 'CNPJ':
-            clean_cnpj = identifier.replace('.', '').replace('/', '').replace('-', '')
-            query = f"""
-                SELECT nome_fundo FROM gerador_fundos
-                WHERE (cnpj_fundo LIKE '%{identifier}%' OR cnpj_fundo LIKE '%{clean_cnpj}%')
-                ORDER BY periodo_fundo DESC LIMIT 1
-            """
-            cursor.execute(query)
-            result = cursor.fetchone()
-            if result:
-                nome_fundo = result[0]
-
+        query = f"""
+            SELECT nome_fundo FROM gerador_fundos
+            WHERE (cnpj_fundo LIKE '%{cnpj_raw}%' OR cnpj_fundo LIKE '%{clean_cnpj}%')
+            ORDER BY periodo_fundo DESC LIMIT 1
+        """
+        cursor.execute(query)
+        result = cursor.fetchone()
         conn.close()
-        return nome_fundo
+        if result: return result[0]
     except Exception as e:
-        print(f"   [DB] ERRO: {e}")
-        return None
+        print(f"   [DB ERRO] Falha ao buscar nome para CNPJ {cnpj_raw}: {e}")
+    return None
 
 
-# --- EXTRAÇÃO DE DADOS (REGEX MELHORADO) ---
-def extract_data_structured(file_path):
-    print(f"\n--- Processando: {os.path.basename(file_path)} ---")
+# --- HELPERS ---
+def detect_text_orientation(image):
     try:
-        doc = pymupdf.open(file_path)
-        # Usamos sort=True para tentar manter a ordem de leitura humana
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text("text", sort=True) + "\n"
-        doc.close()
-    except Exception as e:
-        print(f"Erro PDF: {e}")
-        return {'target_name': None, 'valores': []}
-
-    # 1. Identificar Ativo (Conta tem prioridade sobre CNPJ no regex para garantir o match específico)
-    identifier = None
-    type_id = None
-
-    # Regex para conta BB (ex: 25.165-8 ou 25165-8)
-    conta_match = re.search(r'Conta\s+[:.]?\s*([\d.-]+)', full_text, re.IGNORECASE)
-    cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', full_text)
-
-    if conta_match:
-        # Limpa a conta para ficar igual na apuração (ex: remove pontos extras, mantém traço)
-        raw_conta = conta_match.group(1)
-        identifier = raw_conta
-        type_id = 'CONTA'
-    elif cnpj_match:
-        identifier = cnpj_match.group(0)
-        type_id = 'CNPJ'
-
-    target_name = None
-    if identifier:
-        target_name = get_target_name_from_db(identifier, type_id)
-        if not target_name:
-            target_name = identifier  # Fallback
-
-    print(f"   Alvo definido para busca: '{target_name}' (Tipo: {type_id})")
-
-    # 2. Extrair Valores (Regex "Guloso" que ignora quebras de linha)
-    extracted_vals = []
-    full_text_lower = full_text.lower()
-
-    # Regex genérico poderoso para capturar valores monetários após palavras-chave
-    # Captura: "SALDO ATUAL" ... (espaços/enters) ... "10.000,00"
-    keywords = [
-        r"SALDO ATUAL", r"SALDO BRUTO", r"TOTAL APLICADO", r"TOTAL RESGATADO",
-        r"APLICAÇÕES", r"RESGATES", r"RENDIMENTO BRUTO", r"SALDO EM", r"SALDO FINAL"
-    ]
-
-    for key in keywords:
-        # Procura a palavra chave, seguida de qualquer coisa não-digito (incluindo enters), seguida do valor
-        # O [^\d]*? é o segredo para pular o " =" ou "\n"
-        matches = re.findall(key + r"[^\d\n]*\n?\s*([0-9]{1,3}(?:\.[0-9]{3})*,\d{2})", full_text, re.IGNORECASE)
-        for m in matches:
-            val = normalize_value(m)
-            if val and val != '0,00':
-                extracted_vals.append(val)
-
-    # Remove duplicatas
-    valores_finais = list(set(extracted_vals))
-    print(f"   Valores encontrados: {valores_finais}")
-
-    return {'target_name': target_name, 'valores': valores_finais}
+        custom_config = r'--psm 0'
+        result = pytesseract.image_to_osd(image, config=custom_config)
+        for line in result.split('\n'):
+            if 'Rotate' in line: return int(line.split(':')[1].strip())
+    except:
+        return 0
+    return 0
 
 
-# --- MARCAÇÃO (Busca Exata) ---
+def rotate_image(image, angle):
+    return image.rotate(angle, expand=True)
+
+
+def detect_bank_type(text):
+    text_upper = text.upper()
+    if "ITAÚ" in text_upper or "ITAU" in text_upper: return '341'
+    if "CAIXA" in text_upper or "FUNDO DE INVESTIMENTO" in text_upper: return '104'
+    if "BANCO DO BRASIL" in text_upper or "BB" in text_upper: return '1'
+    if "BRADESCO" in text_upper: return '237'
+    if "SAFRA" in text_upper: return '41'
+    return '11'
+
+
+# --- NOVA LÓGICA: Extrair Conta ---
+def extract_account_hint(filename):
+    base = os.path.splitext(filename)[0]
+    match = re.search(r'(\d+-[0-9xX])$', base, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+# --- EXTRAÇÃO DE DADOS ---
+def extract_advanced_data(pdf_path):
+    filename = os.path.basename(pdf_path)
+    print(f"\n--- Processando: {filename} ---")
+
+    account_hint = extract_account_hint(filename)
+    if account_hint:
+        print(f"   [DICA] Conta identificada no arquivo: {account_hint}")
+
+    extracted_data = {
+        'cnpjs': [],
+        'target_names': [],
+        'account_hint': account_hint,
+        'valores': [],
+        'banco_detectado': None
+    }
+
+    doc = pymupdf.open(pdf_path)
+
+    pg = doc.load_page(0)
+    if len(pg.get_text()) == 0:
+        ocr = True
+        print("   [INFO] PDF é imagem. Ativando OCR...")
+    else:
+        ocr = False
+
+    full_text_accumulated = ""
+
+    for page in doc:
+        text = ""
+        split_text = []
+
+        if ocr:
+            matrix = pymupdf.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=matrix)
+            img = Image.open(io.BytesIO(pix.tobytes()))
+            img = img.convert('L')
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(2)
+            rot = detect_text_orientation(img)
+            if rot != 0: img = rotate_image(img, -rot)
+            text = pytesseract.image_to_string(img, lang='por', config=r'--oem 3 --psm 6')
+            split_text = text.split()
+        else:
+            page.set_rotation((page.rotation + 90) % 360)
+            raw_text = page.get_text()
+            text = raw_text
+            split_text = raw_text.split()
+
+        full_text_accumulated += text
+
+        if not extracted_data['banco_detectado']:
+            extracted_data['banco_detectado'] = detect_bank_type(text)
+            print(f"   [INFO] Banco Detectado: {extracted_data['banco_detectado']}")
+
+        extrato = extracted_data['banco_detectado']
+
+        # BUSCA CNPJs
+        cnpjs_found = re.findall(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', text)
+        for c in cnpjs_found: extracted_data['cnpjs'].append(c)
+
+        if extrato == '341':
+            for i in range(len(split_text)):
+                if split_text[i] == 'CNPJ' and (i + 2 < len(split_text)) and split_text[i + 2] == 'Taxa':
+                    extracted_data['cnpjs'].append(split_text[i + 1])
+
+        # --- BUSCA VALORES (ARRASTÃO) ---
+        if extrato in ['1', '11', '104', '237', '41', '341']:
+
+            # 1. Regex Padrão (Isolado)
+            # Captura 1.000,00 isolado
+            raw_values = re.findall(r'(?:\s|^)([1-9]\d{0,2}(?:\.\d{3})*,\d{2})(?:\s|$)', text)
+            extracted_data['valores'].extend(raw_values)
+
+            # 2. Regex Específico CAIXA (Sufixo C/D)
+            # Captura 1.000,00C ou 1.000,00 D
+            # O grupo de captura é apenas o número
+            if extrato == '104':
+                caixa_values = re.findall(r'(?:\s|^)([1-9]\d{0,2}(?:\.\d{3})*,\d{2})(?:\s*[CDcd])(?:\s|$)', text)
+                extracted_data['valores'].extend(caixa_values)
+
+            # 3. Regex por Contexto (Palavras-chave)
+            keywords = r'(?:SALDO|TOTAL|VALOR|BRUTO|LÍQUIDO|ATUAL|FINAL|RESGATADO|APLICADO)'
+            context_values = re.findall(rf'{keywords}.*?([1-9]\d{{0,2}}(?:\.\d{{3}})*,\d{{2}})', text, re.IGNORECASE)
+            extracted_data['valores'].extend(context_values)
+
+    extracted_data['cnpjs'] = list(set(extracted_data['cnpjs']))
+
+    for cnpj in extracted_data['cnpjs']:
+        nome = get_fund_name_from_db(cnpj)
+        if nome:
+            extracted_data['target_names'].append(nome)
+            print(f"   [DB] {cnpj} -> {nome}")
+
+    # --- LIMPEZA DE VALORES (Remover C, D, R$, Espaços) ---
+    clean_vals = []
+    for v in extracted_data['valores']:
+        if not v: continue
+
+        # Remove letras e símbolos, mantém apenas dígitos, ponto e vírgula
+        # Isso garante que '1.000,00C' vire '1.000,00'
+        v_clean = re.sub(r'[^\d,.]', '', v)
+
+        try:
+            # Valida se é um número válido > 0
+            check_v = v_clean.replace('.', '').replace(',', '.')
+            if float(check_v) > 0:
+                clean_vals.append(v_clean)
+        except:
+            pass
+
+    extracted_data['valores'] = list(set(clean_vals))
+    print(f"   [VALORES] Encontrados {len(extracted_data['valores'])} candidatos.")
+
+    return extracted_data
+
+
+# --- AUDITORIA INTELIGENTE ---
 def highlight_audit_file(apuracao_path, output_path, extratos_data):
-    print("\n========== INICIANDO AUDITORIA ==========")
+    print("\n========== INICIANDO MARCAÇÃO CRUZADA ==========")
     doc = pymupdf.open(apuracao_path)
     total_marks = 0
 
     for item in extratos_data:
-        target = item['target_name']
+        targets = item['target_names']
         valores = item['valores']
+        account_hint = item['account_hint']
+        banco = item.get('banco_detectado', '?')
 
-        if not target or not valores: continue
+        if not targets and not account_hint: continue
 
-        # Limpeza do alvo para busca
-        target_clean = target.strip()
-        print(f">> Procurando linha de: '{target_clean}'")
+        print(f">> Auditando: {targets} (Conta Dica: {account_hint})")
 
-        found_line = False
+        found_account = False
+
         for page in doc:
-            # Busca onde está escrito o NOME DA CONTA ou NOME DO FUNDO
-            # clip=None busca na página toda
-            text_instances = page.search_for(target_clean)
 
-            # Se não achou e é nome longo, tenta parcial
-            if not text_instances and len(target_clean) > 20:
-                text_instances = page.search_for(target_clean[:20])
+            # ESTRATÉGIA 1: CONTA (Esquerda)
+            if account_hint and len(account_hint) >= 3:
+                account_instances = page.search_for(account_hint)
+                valid_account_instances = [rect for rect in account_instances if rect.x0 < 200]
 
-            if text_instances:
-                found_line = True
-                for rect in text_instances:
-                    # Define a "Zona da Linha" (Horizontal)
-                    # Pegamos a altura do texto encontrado e expandimos um pouco para direita
-                    y_center = (rect.y0 + rect.y1) / 2
-                    line_height = rect.y1 - rect.y0
+                if valid_account_instances:
+                    print(f"   [ALVO] Conta {account_hint} localizada!")
+                    found_account = True
+                    for rect in valid_account_instances:
+                        annot = page.add_highlight_annot(rect)
+                        annot.set_colors(stroke=(1, 0.6, 0))
+                        annot.update()
 
-                    # Cria um retângulo que pega a largura TOTAL da página naquela altura Y
-                    # y0 - 2 e y1 + 2 dá uma margem de erro para desalinhamento
-                    search_rect = pymupdf.Rect(0, rect.y0 - 2, page.rect.width, rect.y1 + 2)
+                        search_rect = pymupdf.Rect(0, rect.y0 - 2, page.rect.width, rect.y1 + 2)
 
-                    # Agora procura os valores SÓ DENTRO DESSA FAIXA
-                    for val in valores:
-                        val_instances = page.search_for(val, clip=search_rect)
-                        if val_instances:
-                            print(f"   [SUCESSO] Valor {val} validado e marcado!")
-                            for v_rect in val_instances:
-                                page.add_highlight_annot(v_rect)  # Marca o valor
-                                # Opcional: Marcar o nome também para facilitar visualização
-                                # page.add_underline_annot(rect)
-                                total_marks += 1
+                        for val in valores:
+                            val_instances = page.search_for(val, clip=search_rect)
+                            if val_instances:
+                                print(f"      [CONFIRMADO] Valor {val} batido!")
+                                for v_rect in val_instances:
+                                    annot_v = page.add_highlight_annot(v_rect)
+                                    annot_v.set_colors(stroke=(0, 1, 0))  # Verde
+                                    annot_v.update()
+                                    total_marks += 1
 
-        if not found_line:
-            print(f"   [ALERTA] Não encontrei o texto '{target_clean}' na apuração.")
+            # ESTRATÉGIA 2: NOME DO FUNDO (Fallback)
+            if not found_account:
+                for target_name in targets:
+                    if len(target_name) < 5: continue
+                    text_instances = page.search_for(target_name)
+                    valid_name_instances = [rect for rect in text_instances if rect.x0 < 300]
+
+                    if valid_name_instances:
+                        print(f"   [ALVO] Localizado pelo NOME: {target_name}")
+                        for rect in valid_name_instances:
+                            annot = page.add_highlight_annot(rect)
+                            annot.set_colors(stroke=(0, 0.8, 1))
+                            annot.update()
+
+                            search_rect = pymupdf.Rect(0, rect.y0 - 2, page.rect.width, rect.y1 + 2)
+
+                            for val in valores:
+                                val_instances = page.search_for(val, clip=search_rect)
+                                if val_instances:
+                                    print(f"      [CONFIRMADO] Valor {val} batido!")
+                                    for v_rect in val_instances:
+                                        annot_v = page.add_highlight_annot(v_rect)
+                                        annot_v.set_colors(stroke=(0, 1, 0))
+                                        annot_v.update()
+                                        total_marks += 1
 
     doc.save(output_path)
     return total_marks
@@ -209,37 +280,29 @@ def highlight_audit_file(apuracao_path, output_path, extratos_data):
 # --- ROTAS ---
 @app.route('/process', methods=['POST'])
 def process_audit():
-    if 'apuracao_pdf' not in request.files:
-        return jsonify({'error': 'Faltou o arquivo de apuração'}), 400
-
+    if 'apuracao_pdf' not in request.files: return jsonify({'error': 'Erro arquivo'}), 400
     apuracao = request.files['apuracao_pdf']
     extratos = request.files.getlist('extratos_pdfs')
 
     path_apuracao = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(apuracao.filename))
     apuracao.save(path_apuracao)
 
-    dados_para_auditoria = []
-
+    dados_audit = []
     for ext in extratos:
         if not ext.filename: continue
-        path_ext = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(ext.filename))
-        ext.save(path_ext)
-
-        data = extract_data_structured(path_ext)
-        if data['target_name']:
-            dados_para_auditoria.append(data)
+        p = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(ext.filename))
+        ext.save(p)
+        res = extract_advanced_data(p)
+        if res:
+            dados_audit.append(res)
 
     filename_out = "Auditoria_" + secure_filename(apuracao.filename)
     path_out = os.path.join(app.config['OUTPUT_FOLDER'], filename_out)
 
-    total = highlight_audit_file(path_apuracao, path_out, dados_para_auditoria)
+    total = highlight_audit_file(path_apuracao, path_out, dados_audit)
 
-    msg = f"Concluído! {total} itens validados." if total > 0 else "Processado. Nenhum valor exato encontrado na mesma linha do ativo."
-
-    return jsonify({
-        'message': msg,
-        'file_url': url_for('download_file', filename=filename_out)
-    })
+    msg = f"Auditoria Concluída! {total} itens validados."
+    return jsonify({'message': msg, 'file_url': url_for('download_file', filename=filename_out)})
 
 
 @app.route('/download/<filename>')
@@ -253,4 +316,4 @@ def index():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5001, host='0.0.0.0')
