@@ -296,12 +296,12 @@ def process_audit():
         if res:
             dados_audit.append(res)
 
-    filename_out = "Auditoria_" + secure_filename(apuracao.filename)
+    filename_out = "Correcao_" + secure_filename(apuracao.filename)
     path_out = os.path.join(app.config['OUTPUT_FOLDER'], filename_out)
 
     total = highlight_audit_file(path_apuracao, path_out, dados_audit)
 
-    msg = f"Auditoria Concluída! {total} itens validados."
+    msg = f"Correção Concluída! {total} itens validados."
     return jsonify({'message': msg, 'file_url': url_for('download_file', filename=filename_out)})
 
 
